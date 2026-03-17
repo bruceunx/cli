@@ -632,37 +632,82 @@ mod tests {
     #[test]
     fn test_build_insert_request_with_meet_idempotency_robust() {
         let doc = make_mock_doc();
-        
+
         // Base case
         let args_base = &[
-            "test", "--summary", "S", "--start", "2024-01-01T10:00:00Z", "--end", "2024-01-01T11:00:00Z",
-            "--meet", "--attendee", "a@b.com", "--attendee", "c@d.com"
+            "test",
+            "--summary",
+            "S",
+            "--start",
+            "2024-01-01T10:00:00Z",
+            "--end",
+            "2024-01-01T11:00:00Z",
+            "--meet",
+            "--attendee",
+            "a@b.com",
+            "--attendee",
+            "c@d.com",
         ];
-        let (_, body_base, _) = build_insert_request(&make_matches_insert(args_base), &doc).unwrap();
+        let (_, body_base, _) =
+            build_insert_request(&make_matches_insert(args_base), &doc).unwrap();
         let b_base: serde_json::Value = serde_json::from_str(&body_base).unwrap();
-        let id_base = b_base["conferenceData"]["createRequest"]["requestId"].as_str().unwrap();
+        let id_base = b_base["conferenceData"]["createRequest"]["requestId"]
+            .as_str()
+            .unwrap();
 
         // Same but different attendee order
         let args_reordered = &[
-            "test", "--summary", "S", "--start", "2024-01-01T10:00:00Z", "--end", "2024-01-01T11:00:00Z",
-            "--meet", "--attendee", "c@d.com", "--attendee", "a@b.com"
+            "test",
+            "--summary",
+            "S",
+            "--start",
+            "2024-01-01T10:00:00Z",
+            "--end",
+            "2024-01-01T11:00:00Z",
+            "--meet",
+            "--attendee",
+            "c@d.com",
+            "--attendee",
+            "a@b.com",
         ];
-        let (_, body_reordered, _) = build_insert_request(&make_matches_insert(args_reordered), &doc).unwrap();
+        let (_, body_reordered, _) =
+            build_insert_request(&make_matches_insert(args_reordered), &doc).unwrap();
         let b_reordered: serde_json::Value = serde_json::from_str(&body_reordered).unwrap();
-        let id_reordered = b_reordered["conferenceData"]["createRequest"]["requestId"].as_str().unwrap();
+        let id_reordered = b_reordered["conferenceData"]["createRequest"]["requestId"]
+            .as_str()
+            .unwrap();
 
-        assert_eq!(id_base, id_reordered, "Attendee order should not change requestId");
+        assert_eq!(
+            id_base, id_reordered,
+            "Attendee order should not change requestId"
+        );
 
         // Different summary -> different ID
         let args_diff = &[
-            "test", "--summary", "Diff", "--start", "2024-01-01T10:00:00Z", "--end", "2024-01-01T11:00:00Z",
-            "--meet", "--attendee", "a@b.com", "--attendee", "c@d.com"
+            "test",
+            "--summary",
+            "Diff",
+            "--start",
+            "2024-01-01T10:00:00Z",
+            "--end",
+            "2024-01-01T11:00:00Z",
+            "--meet",
+            "--attendee",
+            "a@b.com",
+            "--attendee",
+            "c@d.com",
         ];
-        let (_, body_diff, _) = build_insert_request(&make_matches_insert(args_diff), &doc).unwrap();
+        let (_, body_diff, _) =
+            build_insert_request(&make_matches_insert(args_diff), &doc).unwrap();
         let b_diff: serde_json::Value = serde_json::from_str(&body_diff).unwrap();
-        let id_diff = b_diff["conferenceData"]["createRequest"]["requestId"].as_str().unwrap();
+        let id_diff = b_diff["conferenceData"]["createRequest"]["requestId"]
+            .as_str()
+            .unwrap();
 
-        assert_ne!(id_base, id_diff, "Different summary should produce different requestId");
+        assert_ne!(
+            id_base, id_diff,
+            "Different summary should produce different requestId"
+        );
     }
 
     #[test]
