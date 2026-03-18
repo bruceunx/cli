@@ -20,12 +20,13 @@ pub(super) async fn handle_reply(
     matches: &ArgMatches,
     reply_all: bool,
 ) -> Result<(), GwsError> {
-    let config = parse_reply_args(matches)?;
+    let mut config = parse_reply_args(matches)?;
     let dry_run = matches.get_flag("dry-run");
 
-    let (original, token) = if dry_run {
+    let (original, token, self_email) = if dry_run {
         (
             OriginalMessage::dry_run_placeholder(&config.message_id),
+            None,
             None,
         )
     } else {
@@ -34,15 +35,21 @@ pub(super) async fn handle_reply(
             .map_err(|e| GwsError::Auth(format!("Gmail auth failed: {e}")))?;
         let client = crate::client::build_client()?;
         let orig = fetch_message_metadata(&client, &t, &config.message_id).await?;
-        let self_email = if reply_all {
+        config.from = resolve_sender(&client, &t, config.from.as_deref()).await?;
+        // For reply-all, always fetch the primary email for self-dedup and
+        // self-reply detection. The resolved sender may be an alias that differs from the primary
+        // address — both must be excluded from recipients. from_alias_email
+        // (extracted from config.from below) handles the alias; self_email
+        // handles the primary.
+        let self_addr = if reply_all {
             Some(fetch_user_email(&client, &t).await?)
         } else {
             None
         };
-        (orig, Some((t, self_email)))
+        (orig, Some(t), self_addr)
     };
 
-    let self_email = token.as_ref().and_then(|(_, e)| e.as_deref());
+    let self_email = self_email.as_deref();
 
     // Determine reply recipients
     let from_alias_email = config
@@ -100,13 +107,12 @@ pub(super) async fn handle_reply(
 
     let raw = create_reply_raw_message(&envelope, &original, &config.attachments)?;
 
-    let auth_token = token.as_ref().map(|(t, _)| t.as_str());
     super::send_raw_email(
         doc,
         matches,
         &raw,
         original.thread_id.as_deref(),
-        auth_token,
+        token.as_deref(),
     )
     .await
 }
@@ -142,6 +148,9 @@ pub(super) struct ReplyConfig {
     pub attachments: Vec<Attachment>,
 }
 
+/// Fetch the authenticated user's primary email from the Gmail profile API.
+/// Used in reply-all for self-dedup (excluding the user from recipients) and
+/// self-reply detection (switching to original-To-based addressing).
 async fn fetch_user_email(client: &reqwest::Client, token: &str) -> Result<String, GwsError> {
     let resp = crate::client::send_with_retry(|| {
         client
@@ -153,16 +162,15 @@ async fn fetch_user_email(client: &reqwest::Client, token: &str) -> Result<Strin
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let err = resp
+        let body = resp
             .text()
             .await
             .unwrap_or_else(|_| "(error body unreadable)".to_string());
-        return Err(GwsError::Api {
-            code: status,
-            message: format!("Failed to fetch user profile: {err}"),
-            reason: "profileFetchFailed".to_string(),
-            enable_url: None,
-        });
+        return Err(super::build_api_error(
+            status,
+            &body,
+            "Failed to fetch user profile",
+        ));
     }
 
     let profile: Value = resp
@@ -193,8 +201,31 @@ fn build_reply_all_recipients(
     self_email: Option<&str>,
     from_alias: Option<&str>,
 ) -> Result<ReplyRecipients, GwsError> {
-    let to_candidates = extract_reply_to_address(original);
     let excluded = collect_excluded_emails(remove, self_email, from_alias);
+
+    // When replying to your own message, the original sender (you) would be
+    // excluded from To, leaving it empty. Gmail web handles this by using the
+    // original To recipients as the reply targets instead, ignoring Reply-To.
+    // (Gmail ignores Reply-To on self-sent messages — we approximate this by
+    // checking the primary address and the current From alias.)
+    let is_self_reply = [self_email, from_alias]
+        .into_iter()
+        .flatten()
+        .any(|e| original.from.email.eq_ignore_ascii_case(e));
+
+    let (to_candidates, mut cc_candidates) = if is_self_reply {
+        // Self-reply: To = original To, CC = original CC
+        let cc = original.cc.clone().unwrap_or_default();
+        (original.to.clone(), cc)
+    } else {
+        // Normal reply: To = Reply-To or From, CC = original To + CC
+        let mut cc = original.to.clone();
+        if let Some(orig_cc) = &original.cc {
+            cc.extend(orig_cc.iter().cloned());
+        }
+        (extract_reply_to_address(original), cc)
+    };
+
     let mut to_emails = std::collections::HashSet::new();
     let to: Vec<Mailbox> = to_candidates
         .into_iter()
@@ -207,18 +238,12 @@ fn build_reply_all_recipients(
         })
         .collect();
 
-    // Combine original To and Cc as CC candidates
-    let mut cc_candidates: Vec<Mailbox> = original.to.clone();
-    if let Some(orig_cc) = &original.cc {
-        cc_candidates.extend(orig_cc.iter().cloned());
-    }
-
     // Add extra CC if provided
     if let Some(extra) = extra_cc {
         cc_candidates.extend(extra.iter().cloned());
     }
 
-    // Filter CC: remove reply-to recipients, excluded addresses, and duplicates
+    // Filter CC: remove To recipients, excluded addresses, and duplicates
     let mut seen = std::collections::HashSet::new();
     let cc: Vec<Mailbox> = cc_candidates
         .into_iter()
@@ -593,7 +618,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_reply_all_from_alias_removes_primary_returns_empty_to() {
+    fn test_build_reply_all_from_alias_is_self_reply() {
+        // When from_alias matches original.from, this is a self-reply.
+        // To should be the original To recipients, not empty.
         let original = OriginalMessage {
             from: Mailbox::parse("sales@example.com"),
             to: vec![Mailbox::parse("bob@example.com")],
@@ -609,7 +636,8 @@ mod tests {
             Some("sales@example.com"),
         )
         .unwrap();
-        assert!(recipients.to.is_empty());
+        assert_eq!(recipients.to.len(), 1);
+        assert_eq!(recipients.to[0].email, "bob@example.com");
     }
 
     fn make_reply_matches(args: &[&str]) -> ArgMatches {
@@ -987,6 +1015,90 @@ mod tests {
             1
         );
         assert!(cc.iter().any(|m| m.email == "carol@example.com"));
+    }
+
+    // --- self-reply tests ---
+
+    #[test]
+    fn test_reply_all_to_own_message_puts_original_to_in_to() {
+        let original = OriginalMessage {
+            from: Mailbox::parse("me@example.com"),
+            to: vec![
+                Mailbox::parse("alice@example.com"),
+                Mailbox::parse("bob@example.com"),
+            ],
+            cc: Some(vec![Mailbox::parse("carol@example.com")]),
+            ..Default::default()
+        };
+        let recipients =
+            build_reply_all_recipients(&original, None, None, Some("me@example.com"), None)
+                .unwrap();
+        // To should be the original To recipients, not the original sender
+        assert_eq!(recipients.to.len(), 2);
+        assert!(recipients.to.iter().any(|m| m.email == "alice@example.com"));
+        assert!(recipients.to.iter().any(|m| m.email == "bob@example.com"));
+        // CC should be the original CC
+        let cc = recipients.cc.unwrap();
+        assert_eq!(cc.len(), 1);
+        assert!(cc.iter().any(|m| m.email == "carol@example.com"));
+    }
+
+    #[test]
+    fn test_reply_all_to_own_message_detected_via_alias() {
+        let original = OriginalMessage {
+            from: Mailbox::parse("alias@work.com"),
+            to: vec![Mailbox::parse("alice@example.com")],
+            ..Default::default()
+        };
+        // self_email is primary, from_alias matches the original sender
+        let recipients = build_reply_all_recipients(
+            &original,
+            None,
+            None,
+            Some("me@gmail.com"),
+            Some("alias@work.com"),
+        )
+        .unwrap();
+        assert_eq!(recipients.to.len(), 1);
+        assert_eq!(recipients.to[0].email, "alice@example.com");
+    }
+
+    #[test]
+    fn test_reply_all_to_own_message_excludes_self_from_original_to() {
+        // You sent to yourself + Alice (e.g. a note-to-self CC'd to someone)
+        let original = OriginalMessage {
+            from: Mailbox::parse("me@example.com"),
+            to: vec![
+                Mailbox::parse("me@example.com"),
+                Mailbox::parse("alice@example.com"),
+            ],
+            ..Default::default()
+        };
+        let recipients =
+            build_reply_all_recipients(&original, None, None, Some("me@example.com"), None)
+                .unwrap();
+        // Self should still be excluded from To
+        assert_eq!(recipients.to.len(), 1);
+        assert_eq!(recipients.to[0].email, "alice@example.com");
+    }
+
+    #[test]
+    fn test_reply_all_to_own_message_ignores_reply_to() {
+        // Gmail web ignores Reply-To on self-sent messages. Verify that
+        // self-reply uses original.to, not Reply-To.
+        let original = OriginalMessage {
+            from: Mailbox::parse("me@example.com"),
+            to: vec![Mailbox::parse("alice@example.com")],
+            reply_to: Some(vec![Mailbox::parse("list@example.com")]),
+            ..Default::default()
+        };
+        let recipients =
+            build_reply_all_recipients(&original, None, None, Some("me@example.com"), None)
+                .unwrap();
+        assert_eq!(recipients.to.len(), 1);
+        assert_eq!(recipients.to[0].email, "alice@example.com");
+        // No CC — Reply-To address should not appear anywhere
+        assert!(recipients.cc.is_none());
     }
 
     // --- dedup_recipients tests ---
